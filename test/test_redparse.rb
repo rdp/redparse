@@ -89,6 +89,7 @@ class Test::Unit::TestCase
   end
 end
 
+#print output immediately on failing test (at end too....)
 require 'test/unit/ui/console/testrunner'
 class Test::Unit::UI::Console::TestRunner
   alias add_fault__no_immed_output add_fault
@@ -98,6 +99,55 @@ class Test::Unit::UI::Console::TestRunner
     add_fault__no_immed_output fault
   end
 end
+
+=begin nice idea, don't work yet
+class Test::Unit::TestResult
+  @@FAILING_CASES=[]
+
+  begin
+    huh #but this is running at the wrong time... 
+    huh #need to run before tests are run but after defined
+    eval Marshal.load(huh).map{|name,case|
+      name=huh quote name
+      "
+       class #{case}      
+         alias_method :'first_off_#{name}', :'#{name}'
+         undef_method :'#{name}'
+       end
+      "
+    }.to_s
+    
+    in_a_loop{
+      huh #ensure methods named first_off_test* get run first
+      some_test_case._method=name
+      some_test_case.run(huh result){huh}
+    }
+
+  rescue Exception
+    #ignore it
+  end
+
+  alias add_error__no_error_memory add_error
+  def add_error x
+    name=x.test_name
+    i=name.rindex('(')
+    @@FAILING_CASES.push [name[0...i],name[i..-1]]
+
+    add_error__no_error_memory x
+  end
+
+  alias add_failure__no_error_memory add_failure
+  def add_failure x
+    name=x.test_name
+    i=name.rindex('(')
+    @@FAILING_CASES.push [name[0...i],name[i..-1]]
+
+    add_failure__no_error_memory x
+  end
+
+  at_exit {huh @@FAILING_CASES}
+end
+=end
 
 class ParseTree
   def put o
@@ -196,6 +246,16 @@ class RedParseTest<Test::Unit::TestCase
   FAILURE_EXAMPLES=[
   ]
   RUBYBUG_EXAMPLES=[
+'    case
+    when 0
+      guecoding
+    else case
+      when eucjp_match_length
+        guing
+      end
+    end',
+
+    'case; when false; else case; when nil; else 5; end; end',
     'def foo(a=b=c={}) end',
     "$11111111111111111111111111111111111111111111111111111111111111111111",
     "c do p (110).m end",
@@ -208,9 +268,30 @@ class RedParseTest<Test::Unit::TestCase
     "p=556;p (e) /a",
     "z{|| p (1).m}",
     'def sum(options = {:weights => weights = Hash.new(1)}); options.empty? or options.keys.size > 1; end',
+    'def sum(options = {:weights => weights = Hash}); 1 end',
   ]
 
   ONELINERS=[
+    'p (a,b=c,d); a +h'...'',
+    'x{return (a,b=c,d)}'...'',
+    'x{r (a,b=c,d)}'...'',
+    'x{return (a,b=c,d)|1}'...'',
+    'x{r (a,b=c,d)|1}'...'',
+    'case; when false; else case; when nil; else 5; end; end'...'',
+    'case;else case; else; end;end'...'',
+    'case; else; end'...'',
+    'c while d and 2.a?(b)..8'...'',
+    'c while d and 888888888888888888888888888888888888888888888888888888..2.a?(b)'...'',
+    'c while d and 8.8..2.a?(b)'...'',
+    'c while d and 8..2.a?(b)'...'',
+    'c while d and :a8..2.a?(b)'...'',
+    'c while d and :a8..:b8'...'',
+    'c while d and a8..:b8'...'',
+    'c while d and 8..:b8'...'',
+    'c while d and /8/..2.a?(b)'...'',
+    'c while d and /8/../2.a?(b)/'...'',
+    'c while d and 8../2.a?(b)/'...'',
+    'c while d and a8../2.a?(b)/'...'',
     'z = valueo_s rescue "?"'...'',
     '"#{publi}#{}>"'...'',
     'return (@images = @old_imgs)'...'',
@@ -2742,6 +2823,24 @@ class RedParseTest<Test::Unit::TestCase
 END
 
   STANZAS=PASSTHRU_BSLASHES_ENTIRE+%q[
+module 
+=begin =end
+=end
+ A; end
+
+module A
+=begin =end
+=end
+ ::B; end
+
+module A::
+=begin =end
+=end
+ B; end
+
+=begin =end
+=end
+
     return @senders[1] =
       2
 
@@ -3747,7 +3846,7 @@ EOS
     end
   end
 
-  BEGIN{p Dir.getwd; File.unlink "problemexprs" rescue nil}
+  BEGIN{File.unlink "problemexprs" rescue nil}
   def problem_exprs
     @problem_exprs||=nil
     return @problem_exprs if @problem_exprs
@@ -3831,9 +3930,6 @@ EOS
         end #rescue false
         
       end #until output.equal? tree 
-
-#      puts "warning: unparser tests disabled for now"
-#      return #skip unparse tests for now
 
       return unless nodes
       begin

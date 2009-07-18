@@ -296,7 +296,7 @@ end
     #do something with error nodes
     msgs=[]
     result.walk{|parent,i,subi,node|
-      not if node.respond_to? :error and node.error?(@rubyversion)
+      not if node.respond_to? :error? and node.error?(@rubyversion)
         msgs<< @filename+":"+node.blame.msg
       end
     } if result.respond_to? :walk #hack hack
@@ -2338,7 +2338,7 @@ end
 
   #for use in lookback patterns
   OPERATORLIKE_LB=OperatorToken|
-                 KW(/^(not | defined\? | .*[@,] | [ ~ ! ; \( \[ \{ ? : ] | \.{1,3} | :: | => | ![=~])$/x)|
+                 KW(/^(not | defined\? | rescue3 | .*[@,] | [ ~ ! ; \( \[ \{ ? : ] | \.{1,3} | :: | => | ![=~])$/x)|
                  KW(%r{^( \*\*? | << | >> | &&? | \|\|? | \^ | % | / | - | \+ )?=$}x)|
                  KW(BEGINWORDS)|KW(/^#{INNERBOUNDINGWORDS}$/)|RescueHeaderNode|StartToken|
                  GoalPostToken|BlockFormalsNode
@@ -2515,7 +2515,8 @@ end
 
     -[HereDocNode, StringToken+1, StringToken.~.la]>>StringCatNode,  
     -[(OPERATORLIKE_LB&~(StringToken|HereDocNode)).lb, StringToken+2, StringToken.~.la]>>StringCatNode,  
-    -[(OPERATORLIKE_LB&~(StringToken|HereDocNode)).lb, StringToken, StringToken.~.la]>>StringNode,  #includes regexp, wordlist, backquotes
+    -[(OPERATORLIKE_LB&~(StringToken|HereDocNode)).lb, StringToken, StringToken.~.la]>>StringNode,  
+      #includes regexp, wordlist, backquotes
 
     -['case', Expr.-, KW(';').-, WhenNode.*, ElseNode.-, 'end']>>CaseNode,
 
