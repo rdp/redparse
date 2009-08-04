@@ -296,7 +296,7 @@ end
     #do something with error nodes
     msgs=[]
     result.walk{|parent,i,subi,node|
-      not if node.respond_to? :error? and node.error?(@rubyversion)
+      if not node.respond_to? :error? and node.error?(@rubyversion)
         msgs<< @filename+":"+node.blame.msg
       end
     } if result.respond_to? :walk #hack hack
@@ -2670,7 +2670,7 @@ end
       when KeywordToken
           case name=result.ident
 
-          when /^(#{BINOP_KEYWORDS.join '|'})$/: #should be like this in rubylexer
+          when /^(#{BINOP_KEYWORDS.join '|'})$/; #should be like this in rubylexer
             result=OperatorToken.new(name,result.offset) unless result.has_end?
           when "|"; result=GoalPostToken.new(result.offset) #is this needed still?
           when "__FILE__"; #I wish rubylexer would handle this
@@ -2815,7 +2815,7 @@ if __FILE__==$0
         puts "RedParse attempted to execute parse data in #{name}"
         next
       end
-    rescue Interrupt: exit 2
+    rescue Interrupt; exit 2
     rescue Exception=>e
 #      puts e.backtrace.join("\n")
       e.message << " during parse of #{name}"
@@ -2852,10 +2852,10 @@ if __FILE__==$0
           ryans=ParseTree.new.parse_tree_for_string(safe_inputs[i],name); nil
         } and raise NeverExecThis
         delta,is_diff=arraydiff(mine,ryans)
-      rescue NeverExecThis:
+      rescue NeverExecThis;
         puts "ParseTree attempted to execute parse data in #{name}"
         next
-      rescue Interrupt: exit 2
+      rescue Interrupt; exit 2
       rescue Exception=>e
         #raise( RuntimeError.new( "#{e} during to_parsetree of #{name}" ) )
         puts "error during to_parsetree of #{name}"
@@ -2882,10 +2882,10 @@ if __FILE__==$0
       end
     end
 
-    rescue NeverExecThis: 
+    rescue NeverExecThis 
       puts "mysterious attempt to execute parse data in #{name}"
       next
-    rescue Interrupt,SystemExit: exit 2
+    rescue Interrupt,SystemExit; exit 2
     rescue Exception=>e
       puts "#{e}:#{e.class}"
       puts e.backtrace.join("\n")

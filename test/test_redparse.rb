@@ -27,6 +27,7 @@ require "redparse"
 require "rubylexer/test/testcases"
 
 $VERBOSE=1
+BEGIN{File.unlink "problemexprs" rescue nil}
 
 class Test::Unit::TestCase
   def known_error
@@ -3846,7 +3847,6 @@ EOS
     end
   end
 
-  BEGIN{File.unlink "problemexprs" rescue nil}
   def problem_exprs
     @problem_exprs||=nil
     return @problem_exprs if @problem_exprs
