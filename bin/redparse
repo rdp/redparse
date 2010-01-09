@@ -18,8 +18,11 @@
     Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
 =end
 $VERBOSE=1 #turn on -w
+$Debug=1
+require 'rubygems'
 require "redparse.rb"
-require 'redparse/problemfiles'
+require "redparse/problemfiles"
+require "redparse/pthelper"
 
 class NeverExecThis<RuntimeError; end
 
@@ -83,9 +86,10 @@ end
 
 
 
-output=:pp
-quiet=true
-ruby187=false
+output=:p
+quiet=false
+verbose=false
+ruby187=ruby19=false
 while /^-/===ARGV.first
     case opt=ARGV.shift
       when "--"; break
@@ -95,19 +99,21 @@ while /^-/===ARGV.first
       when "--vsparsetree"; output=:vsparsetree
       when "--vsparsetree2"; output=:vsparsetree2
       when "--update-problemfiles"; problemfiles=ProblemFiles.new
+      when "--ignore-silly-begins"; ignorebegins=true
       when "--tokens"; ENV['PRINT_TOKENS']='1'
       when "--rawtokens"; ENV['RAW_PRINT_TOKENS']='1'
       when "--stack"; ENV['PRINT_STACK']='1'
-      when "--unparse"; output=:unparse
+      when "--unparse"; unparse=true
       when "--compile", "-c"; compile=true
       when "--macros", "--macro", "-m";
         require 'rubygems'
         require 'macro'
         parserclass=Macro::RedParseWithMacros
       when "-q"; quiet=true
-      when "-v"; quiet=false
+      when "-v"; verbose=true
       when "-e"; inputs=[ARGV.join(" ")]; names=["-e"]; break
       when "-7"; ruby187=true
+      when "-9"; ruby19=true
       else fail "unknown option: #{opt}"
     end
 end
@@ -153,11 +159,16 @@ inputs.each_index{|i|
     begin
       tree=nil
       if catch(:never_exec_this){
+        if ruby19
+          options={:rubyversion=>1.9}
+        else
+          options={:rubyversion=>1.8}
+        end
         tree=if compile
-          huh (parserclass||RedParse).new(input,name).compile
+          huh (parserclass||RedParse).new(input,name,1,[],options).compile
           huh parse
         else
-          (parserclass||RedParse).new(input,name).parse
+          (parserclass||RedParse).new(input,name,1,[],options).parse
         end
         nil
       } #raise NeverExecThis
@@ -169,7 +180,7 @@ inputs.each_index{|i|
         puts "RedParse attempted to execute parse data in #{name}"
         next
       end
-    rescue Interrupt: exit 2
+    rescue Interrupt; exit 2
     rescue Exception=>e
       puts "during parse of #{name}:"
       problemfiles.push name if problemfiles
@@ -186,10 +197,10 @@ inputs.each_index{|i|
     when :pp
       require 'pp'
       pp tree
+    when :p
+      p tree
     when :lisp
       puts tree.to_lisp
-    when :unparse
-      puts tree.unparse
     when :parsetree
       tree=tree.to_parsetree
       hack=tree.dup
@@ -217,6 +228,13 @@ inputs.each_index{|i|
           ryans,warns=ParseTree.new.parse_tree_and_warnings_leaks_stderr(input,name); nil
         } and raise NeverExecThis
         delta,is_diff=arraydiff(mine,ryans)
+
+        if is_diff and ignorebegins
+          mine=RedParse.remove_silly_begins(mine)
+          ryans=RedParse.remove_silly_begins(ryans)
+          delta,is_diff=arraydiff(mine,ryans)
+          was_silly_begin_diff=!is_diff
+        end
       rescue NeverExecThis
         puts "ParseTree attempted to execute parse data in #{name}"
         next
@@ -228,13 +246,13 @@ inputs.each_index{|i|
         raise
       end
       if output==:vsparsetree2
-        if !quiet or is_diff
+        if verbose or is_diff
           puts "mine:"
           pp mine
           puts "ryans:" if is_diff
           pp ryans if is_diff
         end
-      elsif !quiet or is_diff
+      elsif verbose or is_diff
         puts 'differences in '+name if is_diff
         pp delta
       end
@@ -242,9 +260,18 @@ inputs.each_index{|i|
         result=1
         problemfiles.push name if problemfiles
       else
-        puts "no differences in "+name
-        problemfiles.delete name if problemfiles
+        if was_silly_begin_diff
+          puts "differed by a :begin node in "+name
+          problemfiles.push name if problemfiles
+        else
+          puts "no differences in "+name
+          problemfiles.delete name if problemfiles
+        end
       end
+    end
+    if unparse
+      unparsed=tree.unparse
+      puts unparsed unless quiet
     end
 
   rescue NeverExecThis
@@ -252,9 +279,10 @@ inputs.each_index{|i|
     next
   rescue Interrupt,SystemExit; exit 2
   rescue Exception=>e
+    puts "exception while processing #{name}"
     puts "#{e}:#{e.class}"
     puts e.backtrace.join("\n")
-    #problemfiles.push name if problemfiles
+    problemfiles.push name if problemfiles
     #raise
   ensure
     STDOUT.flush

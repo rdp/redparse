@@ -51,6 +51,9 @@ at the end of the README and/or there's a case in test_redparse.rb for
 that failure).
 =end
 
+$VERBOSE=1
+$Debug=1
+
 #require 'test/code/rubylexervsruby'
 #require 'test/code/strgen'
 require "redparse/problemfiles"
@@ -186,7 +189,8 @@ until testdata.empty?
 
 #  puts "testing: "+chunk.join(" ")
   chunk.empty? and next
-  system $RUBY, "-Ilib", "bin/redparse", "--update-problemfiles", "-q", "--vsparsetree", *chunk
+  system $RUBY, "-Ilib", "bin/redparse", "--update-problemfiles", "--ignore-silly-begins", "--unparse", 
+    "-q", "--vsparsetree", *chunk
   exit 2 if $?>>8 == 2  #exit if child got ^c
 end
 end

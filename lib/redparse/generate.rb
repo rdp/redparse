@@ -205,6 +205,10 @@ def repl(rule,m)
   when Class
     %[static VALUE repl_#{rule.name}=rb_const_lookup(rb_const_lookup(kNIL,"RedParse"),"#{repl.name});\n]
   when StackMonkey
+    huh
+  else
+    huh
+  end
 end
 
 def reduce(rule,m)
@@ -235,7 +239,7 @@ def reduce(rule,m)
     SEMANTIC_STACK_SET(yyredval); /* Copy ($$) onto semantic stack.*/
     goto nonterminal_#{str2cname repl.name}; /* Compute transition on produced node type.*/
   ]
-  end
+  #end
 
 rescue Exception=>e
   backtrace.unshift("exception in reduce of rule #{rule.name} #{e.class}:#{e}").join("\n")
@@ -352,7 +356,7 @@ end
   }
   STRMAP_REX=/#{STRMAPPINGS.keys.map{|x| Regexp.quote x}.join "|"}/
   def self.str2cname str
-    str.gsub(STRMAP_REX){|str| STRMAPPINGS[str] } \
+    str.gsub(STRMAP_REX){|str2| STRMAPPINGS[str2] } \
        .gsub(/(?!#{LETTER_DIGIT}).|[X]/o){|ch| 
          "X"+  esc=CHARMAPPINGS[ch[0]] ? esc : ch[0].to_s(16)
        } 

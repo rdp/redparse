@@ -17,13 +17,19 @@
     Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
 =end
 
+$VERBOSE=1
+$Debug=1
 require 'test/unit'
-require 'rubygems'
-require 'parse_tree'
+#require 'parse_tree'
 require 'tempfile'
+begin
+  require 'ron'
+rescue LoadError
+  #do nothing
+end
 
 require "redparse"
-
+require "redparse/pthelper"
 require "rubylexer/test/testcases"
 
 $VERBOSE=1
@@ -91,15 +97,28 @@ class Test::Unit::TestCase
 end
 
 #print output immediately on failing test (at end too....)
-require 'test/unit/ui/console/testrunner'
-class Test::Unit::UI::Console::TestRunner
-  alias add_fault__no_immed_output add_fault
-  def add_fault fault
-    @fault_count||=0
-    output("\n%3d) %s" % [@fault_count+=1, fault.long_display])
-    add_fault__no_immed_output fault
+begin
+  require 'test/unit/ui/console/testrunner'
+  class Test::Unit::UI::Console::TestRunner
+    alias add_fault__no_immed_output add_fault
+    def add_fault fault
+      @fault_count||=0
+      output("\n%3d) %s" % [@fault_count+=1, fault.long_display])
+      add_fault__no_immed_output fault
+    end
   end
+rescue LoadError; #do nothing; just skip this code if test/unit/ui/console/testrunner not present
 end
+
+class MiniTest::Unit
+  alias puke__without_immediate_output puke
+  def puke klass, meth, e
+    result=puke__without_immediate_output klass, meth, e
+    puts @report.last
+    return result
+  end
+end if defined? MiniTest::Unit
+
 
 =begin nice idea, don't work yet
 class Test::Unit::TestResult
@@ -150,37 +169,24 @@ class Test::Unit::TestResult
 end
 =end
 
+require 'redparse/parse_tree_server'
 class ParseTree
-  @@out=@@in=nil
-  def put o
-    o=Marshal.dump o
-    msg= [o.size].pack("N")+o
-    begin
-      @@out.write msg
-    rescue Exception
-      @@out=@@in=nil
-      raise
-    end
-  end
-  def get
-    begin
-      msg=@@in.read(@@in.read(4).unpack("N")[0])
-    rescue Exception
-      @@in=@@out=nil
-      raise
-    end
-    Marshal.load msg
-  end
-  def fork_server?
-    return if @@out
+  class<<self
+  include ParseTreeComm
+  def old_fork_server?
+    @in||=nil; @out||=nil
+    return if @out
+    Process.kill "KILL",@server if @server
+    @server=nil
     si,co=IO::pipe
     ci,so=IO::pipe
-    @@server=fork{
+    @server=fork{
       begin
       co.close; ci.close
-      @@out=so; @@in=si
+      @out=so; @in=si
       warnstash=Tempfile.new "warnstash"
       STDERR.reopen warnstash
+      instance=new
       while 1
         str=get
         exit! if str==:exit!
@@ -189,7 +195,7 @@ class ParseTree
 
         tree=
         begin
-          parse_tree_for_string(str) #tree
+          instance.parse_tree_for_string(str) #tree
         rescue Exception=>e; 
           tree=e
         end
@@ -205,11 +211,31 @@ class ParseTree
       end
     }
     si.close; so.close
-    @@out=co; @@in=ci
+    @out=co; @in=ci
     at_exit { 
       begin 
         put :exit!
-        Process.wait(@@server)
+        Process.wait(@server)
+      rescue Exception
+      end 
+    }
+  end
+
+  def fork_server?
+    @in||=nil; @out||=nil; @server||=nil
+    return if @out
+    Process.kill "KILL",@server if @server
+
+    ruby=ENV["RUBY1_8"]||"ruby"  
+    @out=@in=IO::popen("#{ruby} #{ParseTreeServer.path_to_server_command}", "r+")
+    @server=@in.pid
+    @server_running_187=nil
+    server_running_187?
+
+    at_exit { 
+      begin 
+        put :exit!
+        Process.wait(@server)
       rescue Exception
       end 
     }
@@ -227,6 +253,7 @@ class ParseTree
     end
     raise tree if Exception===tree
     return tree,warnings
+  end
   end
 
   #this way is bad enough, but there's a fd leak this way,
@@ -270,6 +297,18 @@ class RedParseTest<Test::Unit::TestCase
   FAILURE_EXAMPLES=[
   ]
   RUBYBUG_EXAMPLES=[
+
+    #bugs in ruby itself
+    "c do p (110).m end",
+    "p = p m %(1)",
+    "p = p m %(1) ,&t",
+    "p = p m %(1) ,*t",
+    "p = p m %(1) ,t",
+    "p = p m %(1) do end",
+    "p=556;p (e) /a",
+    "z{|| p (1).m}",
+
+    #bugs in ParseTree
 '    case
     when 0
       guecoding
@@ -278,24 +317,84 @@ class RedParseTest<Test::Unit::TestCase
         guing
       end
     end',
-
     'case; when false; else case; when nil; else 5; end; end',
-    'def foo(a=b=c={}) end',
-    "$11111111111111111111111111111111111111111111111111111111111111111111",
-    "c do p (110).m end",
     "case F;when G; else;case; when j; end;end",
-    "p = p m %(1)",
-    "p = p m %(1) ,&t",
-    "p = p m %(1) ,*t",
-    "p = p m %(1) ,t",
-    "p = p m %(1) do end",
-    "p=556;p (e) /a",
-    "z{|| p (1).m}",
+    'def foo(a=b=c={}) end',
     'def sum(options = {:weights => weights = Hash.new(1)}); options.empty? or options.keys.size > 1; end',
     'def sum(options = {:weights => weights = Hash}); 1 end',
+    'def foo(a = 1)    end; def foo(a=b=c={})  end; def bar(a=b=c=1,d=2)  end',
+    'def bar(a=b=1,d=2)  end',
+    'def bar a=b=1,d=2;  end',
+    'x if /f/../o/',
+    'c while d and a8../2.a?(b)/',
+    'c while d and :a8..:b8',
+    'c while d and :a8..2.a?(b)',
+    'c while d and 8.8..2.a?(b)',
+    'c while d and 8../2.a?(b)/',
+    'c while d and 2.a?(b)..8',
+    'c while d and /8/..2.a?(b)',
+    'c while d and /8/../2.a?(b)/',
+    'a if 1..2',
+
+    #not sure which, doesn't really matter anyway
+    "$11111111111111111111111111111111111111111111111111111111111111111111",
   ]
 
   ONELINERS=[
+    'yield [a_i, *p] '...'',
+    '0.113725'...'',
+    '0.777777'...'',
+    'if a; b; elsif c; else d end'...'',
+    '[a=>b,c=>d]'...'',
+    '[a=>b,c=>d,*e]'...'',
+    'class __FILE__::A; b end'...'',
+    'module __FILE__::A; b end'...'',
+    'class __LINE__::A; b end'...'',
+    'module __LINE__::A; b end'...'',
+    'class self::A; b end'...'',
+    'module self::A; b end'...'',
+    'class self::A<B; c end'...'',
+    'module self::A include B; c end'...'',
+    'class a.b.c.d.e.f::Quux; YYY=534 end'...'',
+    'class[Array][0]::Foo; Bazz=556 end'...'',
+    '=begin\r\nfoo\r\n=end\r\n'...'',
+    'a!`b'...'',
+    'fetch_named { {} }'...'',
+    'def subject::Builder.foo; bar end'...'',
+    'class subject::Builder<T; foo end'...'',
+    'module subject::Builder include T; foo end'...'',
+    'class subject::Builder; foo end'...'',
+    'module subject::Builder; foo end'...'',
+    'Hasnew{[]}'...'',
+    'foo::Bar'...'',
+    'x{foo=1; foo::Bar}'...'',
+    '$foo::Bar'...'',
+    '@foo::Bar'...'',
+    '@@foo::Bar'...'',
+    ' (-6000)..476'...'',
+    "case;when 0;ng = 'JIS';else case; when sjis__length; ding = 'EUC-JP' ;end;end"...'',
+    'attribute :invisible do [] end'...'',
+    '"#{queect{|w| w.t{|w| w}}}"'...'',
+    'case z; when a=b=1,d=2; yy end'...'',
+    'begin z; rescue a=b=1,d=2; yy end'...'',
+    '{5=>a=b=1,d=2=>6}'...'',
+    '{a=b=1,d=2}'...'',
+    'a=b=1,d=2'...'',
+    'z=a=b=1,d=2'...'',
+    'p(){|a=b=1,d=2| e}'...'',
+    'p(a=b=1,d=2)'...'',
+    'p a=b=1,d=2'...'',
+    'z[a=b=1,d=2]=5'...'',
+    'z[a=b=1,d=2]'...'',
+    '[a=b=1,d=2]'...'',
+    'UnOpNode===arg and /^$/===arg'...'',
+    'a+b=c rescue d'...'',
+    'a=b=c=d=f rescue g'...'',
+    'z+a=b=c=d=f rescue g'...'',
+    'k=z=c,d'...'',
+    'd=a=b do end'...'',
+    't p = m do 666 end'...'',
+    'a if 1'...'',
     'p (a,b=c,d); a +h'...'',
     'x{return (a,b=c,d)}'...'',
     'x{r (a,b=c,d)}'...'',
@@ -304,18 +403,10 @@ class RedParseTest<Test::Unit::TestCase
     'case; when false; else case; when nil; else 5; end; end'...'',
     'case;else case; else; end;end'...'',
     'case; else; end'...'',
-    'c while d and 2.a?(b)..8'...'',
     'c while d and 888888888888888888888888888888888888888888888888888888..2.a?(b)'...'',
-    'c while d and 8.8..2.a?(b)'...'',
     'c while d and 8..2.a?(b)'...'',
-    'c while d and :a8..2.a?(b)'...'',
-    'c while d and :a8..:b8'...'',
     'c while d and a8..:b8'...'',
     'c while d and 8..:b8'...'',
-    'c while d and /8/..2.a?(b)'...'',
-    'c while d and /8/../2.a?(b)/'...'',
-    'c while d and 8../2.a?(b)/'...'',
-    'c while d and a8../2.a?(b)/'...'',
     'z = valueo_s rescue "?"'...'',
     '"#{publi}#{}>"'...'',
     'return (@images = @old_imgs)'...'',
@@ -323,6 +414,7 @@ class RedParseTest<Test::Unit::TestCase
     'doc_status, err_args = Documeh_status{fcgi_state = 3; docespond do doc_response =fcgi_state =  1; end }'...'',
     'print "coled: " + $! +" wiin #{@ray}\n";'...'',
     'class A;def b;class <<self;@@p = false end;end;end'...'',
+    'class A;def b;class <<self;"#{@@p = false}" end;end;end'...'',
     'def d; return (block_given? ? begin; yield f; ensure; f.close; end : f); end'...'',
     'def sum(options = {:weights => weights = Hash.new(1)}); options.empty? or options.keys.size > 1; end'...'',
     'def d;e install_dir;end'...'',
@@ -372,8 +464,6 @@ class RedParseTest<Test::Unit::TestCase
     "begin begin; ync; p1; end;rr end"...'',
     "begin;mode;rescue;o_chmod rescue nil;end"...'',
     "%w![ ] { } ( ) | - * . \\\\ ? + ^ $ #!"...'',
-
-    'def foo(a = 1)    end; def foo(a=b=c={})  end; def bar(a=b=c=1,d=2)  end'...'',
     '() until 1'...'',
     '(a) until 1'...'',
     '(a) while l 1'...'',
@@ -2041,7 +2131,6 @@ class RedParseTest<Test::Unit::TestCase
       'p(a and b)'...'',   #not legal
 
       '1..2'...'',
-      'a if 1..2'...'',
 
       'nc=(nextchar unless eof?)'...'',
       'super'...'',
@@ -2770,9 +2859,6 @@ class RedParseTest<Test::Unit::TestCase
       'a,b=(*c=b,a)'...'',
       
     ]
-    NOTWORKINGYET=[
-      #later...
-    ]
 
 
    PASSTHRU_BSLASHES_ENTIRE=<<'END'
@@ -2847,6 +2933,17 @@ class RedParseTest<Test::Unit::TestCase
 END
 
   STANZAS=PASSTHRU_BSLASHES_ENTIRE+%q[
+  @@anon = Module.new
+  class @@anon::I
+    bindtextd 
+    def test2    
+      _()      
+    end
+  end
+  module @@anon::J
+    bindt
+  end
+
 module 
 =begin =end
 =end
@@ -2867,15 +2964,6 @@ module A::
 
     return @senders[1] =
       2
-
-    case
-    when 0
-      guecoding     
-    else case
-      when eucjp_match_length 
-        guing
-      end
-    end
 
      %w[ ac
          df]
@@ -3635,45 +3723,52 @@ EOS
 
   WRAPPERS=[ #enable at most 2 or tests take forever!!!
     '(...)',  #normal mode, should usually be enabled
-#    'a rescue (...)',
-#    "((...))",
-#    'def ((...)).foo; end',
-#    'a0 = (...) rescue b0',
-#    'a0 = ((...)) rescue b0',    
-#    '(...)  #with a comment',
-#    "(...)#with comment and newline\n",
-#    "(...)\n",
-#    "(...);p __LINE__",
-#    "defined? (...)",
-#    "a=a (...)",
-#    "b=1;b (...)",
-#    "return (...)"
+    'a rescue (...)',
+    "((...))",
+    'def ((...)).foo; end',
+    'a0 = (...) rescue b0',
+    'a0 = ((...)) rescue b0',    
+    '(...)  #with a comment',
+    "(...)#with comment and newline\n",
+    "(...)\n",
+    "(...);p __LINE__",
+    "defined? (...)",
+    "a=a (...)",
+    "b=1;b (...)",
+    "return (...)",
+    '"#{(...)}"',
   ]
   INJECTABLES=[  #take it easy with these too
-#    'p (1..10).method(:each)',
-#    'a0 rescue b0',
-#    'begin; r; t end',
-#    'a=b,c=d',
+    'p (1..10).method(:each)',
+    'a0 rescue b0',
+    'begin; r; t end',
+    'a=b,c=d',
   ]
-  puts "warning: most data fuzzing is disabled for now"
+  if ENV['MANGLE']
+  else
+    WRAPPERS.slice!(1..-1)
+    INJECTABLES.clear
+    puts "warning: most data fuzzing is disabled; set MANGLE to enable"
+  end
 
   RUBYIDENT=/((?:$|@@?)?#{RubyLexer::LETTER}#{RubyLexer::LETTER_DIGIT}*[?!]?)/o
 
   def self.snippet2testmethod(snippet,wrap=nil)
     escaped=snippet.gsub(/[\\']/){"\\"+$&}
     safe=escaped.gsub(/([^ -~])/){
-      x=$1[0].to_s(16)
+      x=$1[0]
+      x=x.getbyte(0) if String===x
+      x=x.to_s(16)
       x.size==1 and x="0"+x
       "\\x"+x
     }
     safe.gsub! /\\\\/,"__"
     safe[/[^ -~]|\\\\/] and fail
-    cp="check_parsing '#{escaped}',pt"
+    cp="check_parsing '#{escaped}'"
     cp="#{wrap}{#{cp}}" if wrap
     "
       define_method 'test_parsing_of_#{safe}' do
         #puts 'test_parsing_of_#{safe}'
-        pt=ParseTree.new
         #{cp}
       end
     "
@@ -3706,7 +3801,7 @@ EOS
       end
     }
     wrapped+injected
-  }.to_s
+  }.join
   #puts code.split("\n")[5880..5890].join("\n")
   eval code
 
@@ -3717,7 +3812,7 @@ EOS
     /\A\s*x\s*\{(.*)\}\Z/===xmpl and xmpl=$1
 
     snippet2testmethod(xmpl, :known_ruby_bug)
-  }.to_s
+  }.join
   eval error_code
 
   error_code=ERROR_EXAMPLES.map{|xmpl| 
@@ -3727,7 +3822,7 @@ EOS
     /\A\s*x\s*\{(.*)\}\Z/===xmpl and xmpl=$1
 
     snippet2testmethod(xmpl, :known_error)
-  }.to_s
+  }.join
   eval error_code
 
   failure_code=FAILURE_EXAMPLES.map{|xmpl| 
@@ -3737,8 +3832,10 @@ EOS
     /\A\s*x\s*\{(.*)\}\Z/===xmpl and xmpl=$1
 
     snippet2testmethod(xmpl, :known_failure)
-  }.to_s
+  }.join
   eval failure_code
+
+  Test::Unit::AssertionFailedError=MiniTest::Assertion unless defined? Test::Unit::AssertionFailedError
 
   def known_ruby_bug
     from=caller.first
@@ -3767,19 +3864,19 @@ EOS
   def test_case_that_segfaults_ruby185
     assert_equal \
       [[:op_asgn1, [:call, [:vcall, :a], :b], [:zarray], :%, [:vcall, :d]]],
-      RedParse.new('a.b[]%=d','-').parse.to_parsetree(:quirks)
+      RedParse.new('a.b[]%=d','(eval)',1,[],:cache_mode=>:none).parse.to_parsetree(:quirks)
   end
 
   def test_case_that_segfaults_ruby186_slash_parsetree211
     assert_equal  [[:cdecl, [:colon3, :B], [:lit,1]]],
-       RedParse.new('::B=1','-').parse.to_parsetree(:quirks)
+       RedParse.new('::B=1','-',1,[],:cache_mode=>:none).parse.to_parsetree(:quirks)
     assert_equal  [[:cdecl, [:colon2, [:const, :A], :B], [:lit,1]]],
-       RedParse.new('A::B=1','-').parse.to_parsetree(:quirks)
+       RedParse.new('A::B=1','-',1,[],:cache_mode=>:none).parse.to_parsetree(:quirks)
   end
   
   def test_case_that_segfaults_ruby187_slash_parsetree220
     assert_equal  [[:iter, [:fcall, :Proc], [:block_pass, [:dasgn_curr, :b], 0]]],
-       RedParse.new('Proc{|&b|}','-').parse.to_parsetree(:quirks)
+       RedParse.new('Proc{|&b|}','-',1,[],:cache_mode=>:none).parse.to_parsetree(:quirks)
   end
 
   def test_cases_misparsed_by_ruby186_slash_parsetree
@@ -3842,7 +3939,7 @@ EOS
 
 
     }.each_pair{|code,tree| 
-      assert_equal tree,RedParse.new(code,'-').parse.to_parsetree(:quirks)
+      assert_equal tree,RedParse.new(code,'-',1,[],:cache_mode=>:none).parse.to_parsetree(:quirks)
     }
   end
 
@@ -3871,6 +3968,7 @@ EOS
   end
 
   def problem_exprs
+    return nil
     @problem_exprs||=nil
     return @problem_exprs if @problem_exprs
 
@@ -3880,9 +3978,26 @@ EOS
     @problem_exprs=$stdout
   end
 
-  def check_parsing xmpl,pt=ParseTree.new
+  def ParseTree.server_running_187?
+    #@server_running_187||=nil
+    return @server_running_187 unless @server_running_187.nil?
+    put :version
+    version=get
+    if Exception===version
+      puts "cannot find a ruby 1.8 interpreter with parse_tree available to it. set RUBY1_8 to the path of such an interpreter"
+      puts "you might want to try running #{File.dirname(__FILE__)}/generate_parse_tree_server_rc.rb from your ruby 1.8 interpreter"
+      Process.waitpid @server
+      @server=@in=@out=nil
+      raise version
+    end
+    return @server_running_187= version=="1.8.7"
+  end
+
+  def check_parsing xmpl
+    ParseTree.fork_server?
+    xmpl=xmpl.dup.freeze
     pt_opts=[:quirks]
-    pt_opts<<:ruby187 if ::VERSION["1.8.7"]
+    pt_opts<<:ruby187 if ParseTree.server_running_187?
     /unparse/===xmpl and warn 'unparse in parser test data!'
     problem_exprs=problem_exprs()
     nodes=warnings=warnings2=nil
@@ -3905,31 +4020,34 @@ EOS
 #        catch(:never_exec_parse_data_try1){
 #          catch(:never_exec_parse_data_try2){
 #            catch(:never_exec_parse_data_try3){
-              tree,warnings=pt.parse_tree_and_warnings(xmpl)
+              tree,warnings=ParseTree.parse_tree_and_warnings(xmpl)
 #            }
 #          }
 #        }
 #        break if loops+=1 > 3
       rescue Interrupt; raise
       rescue Exception=>e
-        #pp e
-        #pp e.backtrace
-        #raise "last gasp ParseTree exec catcher failed!"
         tree=e
         tree2=nodes=h=nil
         assert_hopefully_raises_Exception(xmpl){
-          nodes=RedParse.new(xmpl,"-").parse
+          nodes=RedParse.new(xmpl,"-",1,[],:cache_mode=>:write_only).parse
           h=nodes.hash
           tree2,warnings2=nodes.to_parsetree_and_warnings(*pt_opts)
         }
         assert_equal h,nodes.hash if h
       else
         begin
-          nodes=RedParse.new(xmpl,"-").parse
+          nodes=RedParse.new(xmpl,"-",1,[],:cache_mode=>:write_only).parse
           h=nodes.hash
           tree2,warnings2=nodes.to_parsetree_and_warnings(*pt_opts)
-          assert_equal h,nodes.hash
-          assert_equal tree, tree2
+          assert_equal h,nodes.hash #Node tree shouldn't be modified by to_parsetree
+          if tree==tree2
+            assert true
+          else
+            assert_equal tree, RedParse.remove_silly_begins(tree2)
+            warn "parse_trees differed by a :begin in #{xmpl}"
+            differed_by_begin=true
+          end
           assert_equal warnings, warnings2 if ENV['WARN_PICKINESS']
           if warnings != warnings2
             if defined? @@mismatched_warnings
@@ -3939,6 +4057,7 @@ EOS
               at_exit{warn "mismatched warnings: #@@mismatched_warnings (set WARN_PICKINESS for details)"}
             end
           end
+        rescue Interrupt; raise
         rescue Exception=>e
           if problem_exprs
             problem_exprs.write xmpl+"\n"
@@ -3954,35 +4073,49 @@ EOS
         
       end #until output.equal? tree 
 
-      return unless nodes
-      begin
-        unparsed=nodes.unparse
-        if unparsed==xmpl
-          assert true
-          return
-        end
-        reparsed= RedParse.new(unparsed,"-").parse
-        if nodes.delete_extraneous_ivars! != reparsed.delete_extraneous_ivars!
-          assert_equal nodes.delete_linenums!, reparsed.delete_linenums!
-          warn "unparser doesn't preserve linenums perfectly in #{xmpl}"
-          if defined? @@unparse_mismatched_linenums
-              @@unparse_mismatched_linenums+=1
-          else
-              @@unparse_mismatched_linenums=1
-              at_exit{warn "unparse mismatched linenums: #@@unparse_mismatched_linenums"}
+      if nodes
+        #test reading back form the cache just created
+        nodes2=RedParse.new(xmpl,"-",1,[],:cache_mode=>:read_only).parse
+        assert_equal nodes,nodes2
+
+        begin
+          unparsed=nodes.unparse
+          if unparsed==xmpl
+            assert true
+            done_already=true
           end
-        else
-          assert true 
+        rescue Exception
+          raise unless Exception===tree
         end
-      rescue Exception
-        raise unless Exception===tree
+        begin
+          reparsed= RedParse.new(unparsed,"-",1,[],:cache_mode=>:none).parse
+          if nodes.delete_extraneous_ivars! != reparsed.delete_extraneous_ivars!
+            assert_equal nodes.delete_linenums!, reparsed.delete_linenums!
+            warn "unparser doesn't preserve linenums perfectly in #{xmpl}"
+            if defined? @@unparse_mismatched_linenums
+                @@unparse_mismatched_linenums+=1
+            else
+                @@unparse_mismatched_linenums=1
+                at_exit{warn "unparse mismatched linenums: #@@unparse_mismatched_linenums"}
+            end
+          else
+            assert true 
+          end
+        rescue Exception
+          raise unless Exception===tree
+        end unless done_already
+
+        assert_equal nodes, Marshal.load(Marshal.dump(nodes))
+        assert_equal nodes, Ron.load(Ron.dump(nodes)) if defined? Ron
+        assert_equal nodes, nodes.deep_copy
+
+        unless done_already or Exception===tree or differed_by_begin
+          tree3=reparsed.to_parsetree(*pt_opts)
+          assert_equal tree, tree3
+        else #missing a syntax errr, but that's been noted already
+        end
       end
 
-      unless Exception===tree
-        tree3=reparsed.to_parsetree(*pt_opts)
-        assert_equal tree, tree3
-      else #missing a syntax errr, but that's been noted already
-      end
 
 #  rescue Exception=>e:
 #      raise "error: #{e}:#{e.class} while testing '#{xmpl}'"

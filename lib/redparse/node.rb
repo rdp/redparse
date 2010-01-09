@@ -27,13 +27,12 @@ require 'tempfile'
 require 'pp'
 require "rubylexer"
 require "reg"
-
+require "redparse/float_accurate_to_s"
 
 
 
 
 class RedParse
-#  module Nodes
     #import token classes from rubylexer
     RubyLexer::constants.each{|k| 
       t=RubyLexer::const_get(k)
@@ -41,12 +40,14 @@ class RedParse
     }
 
     module FlattenedIvars
+      EXCLUDED_IVARS=%w[@data @offset @startline @endline]
+      EXCLUDED_IVARS.push(*EXCLUDED_IVARS.map{|iv| iv.to_sym })
       def flattened_ivars
-        result=[]
-        instance_variables.sort.each{|iv| 
-          if iv!="@data"
-            result.push iv, instance_variable_get(iv)
-          end
+        ivars=instance_variables
+        ivars-=EXCLUDED_IVARS
+        ivars.sort!
+        result=ivars+ivars.map{|iv| 
+          instance_variable_get(iv)
         }
         return result
       end
@@ -148,7 +149,7 @@ class RedParse
       def identity_name
         k=self.class
         list=[k.name]
-        list.concat k.boolean_identity_params.map{|(bip,)| bip if send(bip) }.compact
+        list.concat k.boolean_identity_params.map{|(bip,*)| bip if send(bip) }.compact
         list.concat k.identity_params.map{|(ip,variations)|
           val=send(ip)
           variations.include? val or fail "identity_param #{k}##{ip} unexpected value #{val.inspect}"
@@ -230,7 +231,7 @@ class RedParse
 
       def infix
         @infix if defined? @infix
-      end unless instance_methods.include? "infix"
+      end unless allocate.respond_to? :infix
     end
 
     class OperatorToken
@@ -242,25 +243,18 @@ class RedParse
                               ]+RubyLexer::OPORBEGINWORDLIST+%w<; lhs, rhs, rescue3>
       #identity_param :unary, true,false,nil
       #identity_param :tag, :lhs,:rhs,:param,:call,:array,:block,:nested,nil
-
-      #this should be in rubylexer
-      def as
-        if tag and ident[/^[,*&]$/]
-          tag.to_s+ident
-        end
-      end
     end
 
     class NumberToken
       alias to_lisp to_s
-      def negative; /\A-/ === ident end unless instance_methods.include? "negative"
+      def negative; /\A-/ === ident end unless allocate.respond_to? :negative
 
       identity_param :negative, true,false
     end
 
     class MethNameToken
       alias to_lisp to_s
-      def has_equals; /#{LETTER_DIGIT}=$/o===ident end unless instance_methods.include? "has_equals"
+      def has_equals; /#{LETTER_DIGIT}=$/o===ident end unless allocate.respond_to? :has_equals
 
       identity_param :has_equals, true,false
     end
@@ -389,14 +383,8 @@ class RedParse
         @endline||=0
       end
 
-      def flattened_ivars
-        result=super
-        result.each_with_index{|x,i|
-          if i&1==0 and x!="@data"
-            result[i,2]=[]
-          end
-        }
-        result
+      def self.create(*args)
+        new(*args)
       end
 
       def ==(other)
@@ -468,18 +456,84 @@ class RedParse
         return result
       end
 
-      def inspect
-        ivarnames=instance_variables-["@data"]
+      def inspect label=nil,indent=0
+        ivarnames=instance_variables-FlattenedIvars::EXCLUDED_IVARS
+        ivarnodes=[]
+        ivars=ivarnames.map{|ivarname|
+          ivar=instance_variable_get(ivarname)
+          if Node===ivar
+            ivarnodes.push [ivarname,ivar]
+            nil
+          else
+            ivarname[1..-1]+"="+ivar.inspect if ivar
+          end
+        }.compact.join(' ')
+
+
+        pos=@startline.to_s
+        pos<<"..#@endline" if @endline!=@startline
+        pos<<"@#@offset"
+        classname=self.class.name
+        classname.sub!(/^(?:RedParse::)?(.*?)(?:Node)?$/){$1}
+        result= [' '*indent,"+",(label+': ' if label),classname," pos=",pos," ",ivars,"\n"]
+        indent+=2
+
+        namelist=self.class.namelist
+        if namelist and !namelist.empty?
+          namelist.each{|name|
+            val=send name rescue "{{ERROR INSPECTING ATTR #{name}}}"
+            case val
+              when Node; result<< val.inspect(name,indent)
+              when ListInNode 
+                result.push ' '*indent,"#{name}:\n",*val.map{|v| 
+                  v.inspect(nil,indent+2) rescue ' '*(indent+2)+"-#{v.inspect}\n"
+                }
+              when nil;
+              else ivars<< " #{name}=#{val.inspect}"
+            end
+          }
+        else
+          each{|val|
+            case val
+            when Node; result<< val.inspect(nil,indent) 
+            else result<< ' '*indent+"-#{val.inspect}\n"
+            end
+          }
+        end
+
+        ivarnodes.each{|(name,val)|
+          result<< val.inspect(name,indent)
+        }
+
+        return result.join
+      end
+
+      def evalable_inspect
+        ivarnames=instance_variables-["@data", :@data]
         ivars=ivarnames.map{|ivarname| 
-          ":"+ivarname+"=>"+instance_variable_get(ivarname).inspect 
+          val=instance_variable_get(ivarname)
+          if val.respond_to?(:evalable_inspect)
+            val=val.evalable_inspect
+          else
+            val=val.inspect
+          end
+          ":"+ivarname+"=>"+val 
         }.join(', ')
-        bare=super
+
+        bare="["+map{|val|
+          if val.respond_to?(:evalable_inspect)
+            val=val.evalable_inspect
+          else
+            val=val.inspect
+          end
+        }.join(", ")+"]"
+
         bare.gsub!(/\]\Z/, ", {"+ivars+"}]") unless ivarnames.empty?
         return self.class.name+bare
       end
- 
+
       def pretty_print(q)
-        ivarnames=instance_variables-["@data"]
+        ivarnames=instance_variables-["@data", :@data]
         ivars={}
         ivarnames.each{|ivarname| 
           ivars[ivarname.to_sym]=instance_variable_get(ivarname)
@@ -497,29 +551,32 @@ class RedParse
       def self.param_names(*names)
         accessors=[]
         namelist=[]
-        namelist2=[]
+        @namelist=[]
         names.each{|name| 
           name=name.to_s
           last=name[-1]
           name.chomp! '!' and name << ?_
-          namelist2 << name
+          namelist << name
           unless last==?_
-            accessors << "def #{name.chomp('_')}; self[#{namelist.size}] end\n"
-            accessors << "def #{name.chomp('_')}=(newval); self[#{namelist.size}]=newval end\n"
-            namelist << name
+            accessors << "def #{name.chomp('_')}; self[#{@namelist.size}] end\n"
+            accessors << "def #{name.chomp('_')}=(newval); "+
+                         "newval.extend ::RedParse::ListInNode if ::Array===newval and not RedParse::Node===newval;"+
+                         "self[#{@namelist.size}]=newval "+
+                         "end\n"
+            @namelist << name
           end
         }
         init="
-          def initialize(#{namelist2.join(', ')})
-            replace [#{namelist.size==1 ? 
-                      namelist.first : 
-                      namelist.join(', ')
+          def initialize(#{namelist.join(', ')})
+            replace [#{@namelist.size==1 ? 
+                      @namelist.first : 
+                      @namelist.join(', ')
                   }]
           end
           alias init_data initialize
              "
 
-        code= "class ::#{self}\n"+init+accessors.to_s+"\nend\n"
+        code= "class ::#{self}\n"+init+accessors.join+"\nend\n"
         if defined? DEBUGGER__ or defined? Debugger
           Tempfile.open("param_name_defs"){|f|
             f.write code
@@ -529,6 +586,15 @@ class RedParse
         else
           eval code
         end
+
+        @namelist.reject!{|name| /_\Z/===name }
+      end
+
+      def self.namelist
+        #@namelist
+        result=superclass.namelist||[] rescue []
+        result.concat @namelist if defined? @namelist
+        return result
       end
 
       def lhs_unparse o; unparse(o) end
@@ -588,12 +654,14 @@ class RedParse
       end
 
       def depthwalk(parent=nil,index=nil,subindex=nil,&callback)
-        each_with_index{|datum,i|
+        (size-1).downto(0){|i|
+          datum=self[i]
           case datum
           when Node
             datum.depthwalk(self,i,&callback)
           when Array
-            datum.each_with_index{|x,j| 
+            (datum.size-1).downto(0){|j|
+              x=datum[j]
               if Node===x
                 x.depthwalk(self,i,j,&callback) 
               else 
@@ -602,6 +670,24 @@ class RedParse
             }
           else 
             callback[self, i, nil, datum]
+          end
+        }
+        callback[ parent,index,subindex,self ]
+      end
+
+      def depthwalk_nodes(parent=nil,index=nil,subindex=nil,&callback)
+        (size-1).downto(0){|i|
+          datum=self[i]
+          case datum
+          when Node
+            datum.depthwalk_nodes(self,i,&callback)
+          when Array
+            (datum.size-1).downto(0){|j|
+              x=datum[j]
+              if Node===x
+                x.depthwalk_nodes(self,i,j,&callback)
+              end
+            }
           end
         }
         callback[ parent,index,subindex,self ]
@@ -616,31 +702,100 @@ class RedParse
       attr_accessor :parent
 
       def xform_tree!(*xformers)
+        #search tree for patterns and store results of actions in session
         session={}
         depthwalk{|parent,i,subi,o|
           xformers.each{|xformer|
-            xformer.xform!(o,session) if o
+            if o
+              tempsession={}
+              xformer.xform!(o,tempsession)
+              merge_replacement_session session, tempsession
+            #elsif xformer===o and Reg::Transform===xformer
+            #  new=xformer.right
+            #  if Reg::Formula===right
+            #    new=new.formula_value(o,session)
+            #  end
+            #  subi ? parent[i][subi]=new : parent[i]=new
+            end
           }
         }
         session["final"]=true
+        
+        #apply saved-up actions stored in session, while making a copy of tree
+        result=::Ron::GraphWalk::graphcopy(self,old2new={}){|cntr,o,i,ty,useit|
+          newo=nil
+          replace_value o.__id__,o,session do |val|
+            newo=val
+            useit[0]=true
+          end
+          newo
+        }
+        finallys=session["finally"] #finallys too
+        finallys.each{|(action,arg)| action[old2new[arg.__id__],session] } if finallys
+
+        return result
+=begin was
+        finallys=session["finally"]
+        finallys.each{|(action,arg)| action[arg] } if finallys
+
         depthwalk{|parent,i,subi,o|
-          if session.has_key? o.__id__
-            new= session[o.__id__]
-            if Reg::Formula===new
-              new=new.formula_value(o,session)
-            end
+          next unless parent
+          replace_ivars_and_self o, session do |new|
             subi ? parent[i][subi]=new : parent[i]=new
           end
         }
-        if session.has_key? self.__id__
-          new= session[self.__id__]
-          if Reg::Formula===new
-            new=new.formula_value(self,session)
-          end
+        replace_ivars_and_self self,session do |new|
+          fail unless new
           return new
-        else
-          return self
         end
+
+        return self
+=end
+      end
+
+      def replace_ivars_and_self o,session,&replace_self_action
+          o.instance_variables.each{|ovname|
+            ov=o.instance_variable_get(ovname)
+            
+            replace_value ov.__id__,ov,session do |new|
+              o.instance_variable_set(ovname,new)
+            end
+          }
+          replace_value o.__id__,o,session, &replace_self_action
+      end
+
+      def replace_value ovid,ov,session,&replace_action
+          if session.has_key? ovid
+              new= session[ovid]
+              if Reg::Formula===new
+                new=new.formula_value(ov,session)
+              end
+              replace_action[new]
+          end
+      end
+
+      def merge_replacement_session session,tempsession
+        ts_has_boundvars= !tempsession.keys.grep(::Symbol).empty?
+        tempsession.each_pair{|k,v|
+          if Integer===k
+if true
+            v=Reg::WithBoundRefValues.new(v,tempsession) if ts_has_boundvars
+else
+            v=Ron::GraphWalk.graphcopy(v){|cntr,o,i,ty,useit|
+              if Reg::BoundRef===o
+                useit[0]=true
+                tempsession[o.name]||o
+              end
+            }
+end
+            if session.has_key? k
+              v=v.chain_to session[k]
+            end
+            session[k]=v
+          elsif "finally"==k
+            session["finally"]=Array(session["finally"]).concat v
+          end
+        }
       end
 
       def linerange
@@ -663,7 +818,7 @@ class RedParse
           j=nil
           list=Array.new(node)
           assignnode=nil
-          list.each_with_index{|assignnode,jj|
+          list.each_with_index{|assignnode2,jj| assignnode=assignnode2
             AssignNode===assignnode and break(j=jj)
           }
           fail "CommaOpNode without any assignment in final parse tree" unless j
@@ -788,6 +943,7 @@ class RedParse
       def unary; false end
       def lvalue; nil end
 
+      #why not use Ron::GraphWalk.graph_copy instead here?
       def deep_copy transform={},&override
         handler=proc{|child|
           if transform.has_key? child.__id__ 
@@ -798,28 +954,25 @@ class RedParse
                 override&&override[child] or 
                   child.deep_copy(transform,&override)
             when Array
-                child.map(&handler)
-            when Integer,Symbol,Float,nil,false,true,Module:
+                child.clone.map!(&handler)
+            when Integer,Symbol,Float,nil,false,true,Module
                 child
             else 
-                child.dup
+                child.clone
             end
           end
         }
 
         newdata=map(&handler)
 
-        h={}
-        result_module=nil
+        result=clone
         instance_variables.each{|iv| 
-          unless iv=="@data"
+          unless iv=="@data" or iv==:@data
             val=instance_variable_get(iv)
-            h[iv]=handler[val]
-            result_module=val if iv=="@module" #hacky
+            result.instance_variable_set(iv,handler[val])
           end
         }
-        result= self.class[*newdata << h]
-        result.extend result_module if result_module
+        result.replace newdata
         return result
       end
 
@@ -829,6 +982,7 @@ class RedParse
           when Node
             node.remove_instance_variable :@offset rescue nil
             node.remove_instance_variable :@loopword_offset rescue nil
+            node.remove_instance_variable :@iftok_offset rescue nil
             node.remove_instance_variable :@endline rescue nil
             node.remove_instance_variable :@lvalue rescue nil
             if node.respond_to? :lvalue 
@@ -958,11 +1112,11 @@ class RedParse
     end
 
     class VarNode<ValueNode
+      param_names :ident
       include FlattenedIvars
       attr_accessor :endline,:offset
       attr_reader :lvar_type,:in_def
       attr_writer :lvalue
-
 
       alias == flattened_ivars_equal?
 
@@ -974,8 +1128,8 @@ class RedParse
         @in_def=tok.in_def
       end
 
-      def ident; first end
-      def ident=x; self[0]=x end
+#      def ident; first end
+#      def ident=x; self[0]=x end
       alias image ident
       alias startline endline
       alias name ident
@@ -983,7 +1137,7 @@ class RedParse
 
       def parsetree(o)
         type=case ident[0]
-         when ?$: 
+         when ?$
            case ident[1]
            when ?1..?9; return [:nth_ref,ident[1..-1].to_i]
            when ?&,?+,?`,?'; return [:back_ref,ident[1].chr.to_sym] #`
@@ -1046,7 +1200,7 @@ class RedParse
 
       def dup
         result=super
-        result.ident=@ident.dup if @ident
+        result.ident=ident.dup if ident
         return result
       end
 
@@ -1065,52 +1219,79 @@ end
     end
 
     #forward decls
-    module ArrowOpNode; end
-    module RangeNode; end
-    module LogicalNode; end
-    module WhileOpNode; end
-    module UntilOpNode; end
-    module IfOpNode; end
-    module UnlessOpNode; end
-    module OpNode; end
-    module NotEqualNode; end
-    module MatchNode; end
-    module NotMatchNode; end
+    class RawOpNode<ValueNode
+    end
+    class OpNode<RawOpNode
+    end
+    class NotEqualNode<OpNode
+    end
+    class MatchNode<OpNode
+    end
+    class NotMatchNode<OpNode
+    end
+    class ArrowOpNode<RawOpNode
+    end
+    class RescueOpNode<RawOpNode
+    end
+    class LogicalNode<RawOpNode
+    end
+    class AndNode<LogicalNode
+    end
+    class OrNode<LogicalNode
+    end
+    class RangeNode<RawOpNode
+    end
+    class IfOpNode<RawOpNode
+    end
+    class UnlessOpNode<RawOpNode
+    end
+    class WhileOpNode<RawOpNode
+    end
+    class UntilOpNode<RawOpNode
+    end
 
-    OP2MIXIN={
-      "=>"=>ArrowOpNode,
-      ".."=>RangeNode,
-      "..."=>RangeNode,
-      "&&"=>LogicalNode,
-      "||"=>LogicalNode,
-      "and"=>LogicalNode,
-      "or"=>LogicalNode,
-      "while"=>WhileOpNode,
-      "until"=>UntilOpNode,
-      "if"=>IfOpNode,
-      "unless"=>UnlessOpNode,
+    OP2CLASS={
       "!="=>NotEqualNode,
       "!~"=>NotMatchNode,
       "=~"=>MatchNode,
+      "if"=>IfOpNode,
+      "unless"=>UnlessOpNode,
+      "while"=>WhileOpNode,
+      "until"=>UntilOpNode,
+      ".."=>RangeNode,
+      "..."=>RangeNode,
+      "=>"=>ArrowOpNode,
+      "&&"=>AndNode,
+      "||"=>OrNode,
+      "and"=>AndNode,
+      "or"=>OrNode,
+      "rescue"=>RescueOpNode,
+      "rescue3"=>RescueOpNode,
     }
 
     class RawOpNode<ValueNode
       param_names(:left,:op,:right)
-      def initialize(left,op,right)
-        @offset=op.offset
-        op=op.ident
+      def initialize(left,op,right=nil)
+        op,right=nil,op if right.nil?
+        if op.respond_to? :ident
+          @offset=op.offset
+          op=op.ident
+        end
         super(left,op,right)
-        Array((OP2MIXIN[op]||OpNode)).each{|mod|
-          extend(mod)        
-          mod.instance_method(:initialize).bind(self).call(left,op,right)
-        }
       end
-      def self.[](*args)
-        result=super
-        @module and extend @module
-        return result
+
+#      def initialize_copy other
+#        rebuild(other.left,other.op,other.right)
+#      end
+
+      def self.create(left,op,right)
+        op_s=op.ident
+        k=OP2CLASS[op_s]||OpNode
+        k.new(left,op,right)
       end
+
       def image; "(#{op})" end
+
       def raw_unparse o
         l=left.unparse(o)
         l[/(~| \Z)/] and maybesp=" "
@@ -1118,10 +1299,11 @@ end
       end
     end
 
-    module OpNode
+    class OpNode<RawOpNode
       def initialize(left,op,right)
         #@negative_of="="+$1 if /^!([=~])$/===op
-        @module=OpNode
+        op=op.ident if op.respond_to? :ident
+        super left,op,right      
       end
       def to_lisp
         "(#{op} #{left.to_lisp} #{right.to_lisp})"
@@ -1147,8 +1329,13 @@ end
 #      def unparse o=default_unparse_options; raw_unparse o end
     end
 
-    module MatchNode
-      include OpNode
+    class MatchNode<OpNode
+      param_names :left,:op_,:right
+
+      def initialize(left,op,right=nil)
+        op,right=nil,op unless right
+        replace [left,right]
+      end
 
       def parsetree(o)
         if StringNode===left and left.char=='/'
@@ -1162,8 +1349,13 @@ end
       def op; "=~"; end
     end
 
-    module NotEqualNode
-      include OpNode
+    class NotEqualNode<OpNode
+      param_names :left,:op_,:right
+
+      def initialize(left,op,right=nil)
+        op,right=nil,op unless right
+        replace [left,right]
+      end
 
       def parsetree(o)
         result=opnode_parsetree(o)
@@ -1174,8 +1366,13 @@ end
       def op; "!="; end
     end
 
-    module NotMatchNode
-      include NotEqualNode
+    class NotMatchNode<OpNode
+      param_names :left,:op_,:right
+
+      def initialize(left,op,right=nil)
+        op,right=nil,op unless right
+        replace [left,right]
+      end
 
       def parsetree(o)
         if StringNode===left and left.char=="/"
@@ -1183,7 +1380,9 @@ end
         elsif StringNode===right and right.char=="/"
           [:not, [:match3, right.parsetree(o), left.parsetree(o)]]
         else
-          super
+          result=opnode_parsetree(o)
+          result[2]="=#{op[1..1]}".to_sym
+          result=[:not, result]
         end
       end
 
@@ -1217,6 +1416,26 @@ end
       end
       attr_writer :lvalue
       identity_param :lvalue, nil, true
+
+      def extract_unbraced_hash
+          param_list=Array.new(self)
+          first=last=nil
+          param_list.each_with_index{|param,i|
+            break first=i if ArrowOpNode===param
+          }
+          (1..param_list.size).each{|i| param=param_list[-i]
+            break last=-i if ArrowOpNode===param
+          }
+          if first
+            arrowrange=first..last
+            arrows=param_list[arrowrange]
+            h=HashLiteralNode.new(nil,arrows,nil)
+            h.offset=arrows.first.offset
+            h.startline=arrows.first.startline
+            h.endline=arrows.last.endline
+            return h,arrowrange
+          end
+      end
     end
 
     class LiteralNode<ValueNode; end
@@ -1303,9 +1522,8 @@ end
         return "" if empty?
         unparse_nl(first,o,'')+first.unparse(o)+
         self[1..-1].map{|expr| 
-#          p expr
           unparse_nl(expr,o)+expr.unparse(o)
-        }.to_s
+        }.join
       end
     end
 
@@ -1322,7 +1540,7 @@ end
         sum=''
         type=:str
         tree=i=nil
-        result.each_with_index{|tree,i| 
+        result.each_with_index{|tree2,i2| tree,i=tree2,i2 
           sum+=tree[1]
           tree.first==:str or break(type=:dstr)
         }
@@ -1350,42 +1568,70 @@ end
       end
     end
 
-#    class ArrowOpNode<ValueNode
-#      param_names(:left,:arrow_,:right)
-#    end
-     module ArrowOpNode
-       def initialize(*args) 
-         @module=ArrowOpNode
-       end
+    class ArrowOpNode
+      param_names(:left,:op,:right)
 
-       def unparse(o=default_unparse_options)
-         left.unparse(o)+" => "+right.unparse(o)
-       end
-     end
-
-#    class RangeNode<ValueNode
-    module RangeNode
-#      param_names(:first,:op_,:last)
-      def initialize(left,op_,right)
-        @exclude_end=!!op_[2]
-        @module=RangeNode
-        @as_flow_control=false
-#        super(left,right)
+      def initialize(*args)
+        super
       end
-      def begin; left end
-      def end; right end
-      def first; left end
-      def last; right end
+
+      #def unparse(o=default_unparse_options)
+      #  left.unparse(o)+" => "+right.unparse(o)
+      #end
+    end
+
+    class RangeNode
+      param_names(:first,:op,:last)
+      def initialize(left,op,right=nil)
+        op,right="..",op unless right
+        op=op.ident if op.respond_to? :ident
+        @exclude_end=!!op[2]
+        @as_flow_control=false
+        super(left,op,right)
+      end
+      def begin; first end
+      def end; last end
+      def left; first end
+      def right; last end
       def exclude_end?; @exclude_end end
+
+#      def self.[] *list
+#        result=RawOpNode[*list]
+#        result.extend RangeNode
+#        return result
+#      end
+
+      def self.[] *list
+        new(*list)
+      end
 
       def parsetree(o)
         first=first().parsetree(o)
         last=last().parsetree(o)
-        if :lit==first.first and :lit==last.first and
-           Fixnum===first.last and Fixnum===last.last
-          return [:lit, Range.new(first.last,last.last,@exclude_end)]
+        if @as_flow_control
+          if :lit==first.first and Integer===first.last 
+            first=[:call, [:lit, first.last], :==, [:array, [:gvar, :$.]]]
+          elsif :lit==first.first && Regexp===first.last or 
+                :dregx==first.first || :dregx_once==first.first
+            first=[:match, first]
+          end
+
+          if :lit==last.first and Integer===last.last
+            last=[:call, [:lit, last.last], :==, [:array, [:gvar, :$.]]]
+          elsif :lit==last.first && Regexp===last.last or 
+                :dregx==last.first || :dregx_once==last.first
+            last=[:match, last]
+          end
+
+          tag="flip"
+        else
+          if :lit==first.first and :lit==last.first and
+             Fixnum===first.last and Fixnum===last.last and
+             LiteralNode===first() and LiteralNode===last()
+            return [:lit, Range.new(first.last,last.last,@exclude_end)]
+          end
+          tag="dot"
         end
-        tag= @as_flow_control ? "flip" : "dot"
         count= @exclude_end ? ?3 : ?2
         tag << count
         [tag.to_sym, first, last]
@@ -1406,8 +1652,8 @@ end
     class UnOpNode<ValueNode
       param_names(:op,:val)
       def initialize(op,val)
-        @offset=op.offset
-        op=op.ident
+        @offset||=op.offset rescue val.offset
+        op=op.ident if op.respond_to? :ident
         /([&*])$/===op and op=$1+"@"
         /^(?:!|not)$/===op and 
           val.respond_to? :special_conditions! and 
@@ -1460,9 +1706,14 @@ end
     end
 
     class UnaryStarNode<UnOpNode
-      def initialize(op,val)
-        op.ident="*@"
+      def initialize(op,val=nil)
+        op,val="*@",op unless val
+        op.ident="*@" if op.respond_to? :ident
         super(op,val)
+      end
+
+      class<<self
+        alias [] new
       end
 
       def parsetree(o)
@@ -1488,10 +1739,10 @@ end
 
     class DanglingStarNode<UnaryStarNode
       #param_names :op,:val
-      def initialize(star)
-        @offset= star.offset
-        replace ['*@',var=VarNode.new(VarNameToken.new('',offset))]
-        var.startline=var.endline=star.startline
+      def initialize(star,var=nil)
+        @offset= star.offset if star.respond_to? :offset
+        @startline=@endline=star.startline if star.respond_to? :startline
+        super('*@',var||VarNode[''])
       end
       attr :offset
       def lvars_defined_in; [] end
@@ -1560,6 +1811,13 @@ end
       end
       attr_writer :lvalue
       identity_param :lvalue, nil, true
+
+      def inspect label=nil,indent=0
+        result=' '*indent
+        result+="#{label}: " if label 
+        result+='Constant '
+        result+=map{|name| name.inspect}.join(', ')+"\n"
+      end
     end
     LookupNode=ConstantNode
 
@@ -1619,139 +1877,10 @@ end
       attr_writer :lvalue
     end
 
-=begin
-    class OldParenedNode<ValueNode
-      param_names :body, :rescues, :else!, :ensure!
-      def initialize(*args)
-        @empty_ensure=@op_rescue=nil
-        replace(
-        if args.size==3  #()
-          if (KeywordToken===args.first and args.first.ident=='(')
-            [args[1]] 
-          else
-            expr,rescueword,backup=*args
-            @op_rescue=true
-            [expr,[RescueNode[[],nil,backup]],nil,nil]    
-          end
-        else
-          body,rescues,else_,ensure_=*args[1...-1]
-          if else_
-            else_=else_.val or @empty_else=true
-          end
-          if ensure_
-            ensure_=ensure_.val or @empty_ensure=true
-          end
-          [body,rescues,else_,ensure_]
-        end
-        )
-      end
-
-      alias ensure_ ensure
-      alias else_ else
-
-      attr_reader :empty_ensure, :empty_else
-      attr_accessor :after_comma, :after_equals
-      def op?; @op_rescue; end
-
-      def image; '(begin)' end
-
-      def special_conditions!
-        if size==1
-          node=body
-          node.special_conditions! if node.respond_to? :special_conditions!
-        end
-      end
-
-      def to_lisp
-        huh #what about rescues, else, ensure?
-        body.to_lisp
-      end
- 
-      def parsetree(o)
-        if size==1
-          body.parsetree(o)
-        else
-          body=body()
-          target=result=[]   #was: [:begin, ]
-
-          #body,rescues,else_,ensure_=*self
-          target.push target=[:ensure, ] if ensure_ or @empty_ensure
-
-          rescues=rescues().map{|resc| resc.parsetree(o)}
-          if rescues.empty? 
-            else_ and
-              body=SequenceNode.new(body,nil,else_)
-            else_=nil
-          else 
-            target.push newtarget=[:rescue, ]
-            else_=else_()
-          end
-          if body 
-              needbegin=  (BeginNode===body and body.after_equals)
-              body=body.parsetree(o) 
-              body=[:begin, body] if needbegin and body.first!=:begin and !o[:ruby187]
-              (newtarget||target).push body if body
-          end
-          target.push ensure_.parsetree(o) if ensure_
-          target.push [:nil] if @empty_ensure
-          target=newtarget if newtarget
-          
-          unless rescues.empty?
-            target.push linked_list(rescues)
-          end
-          target.push else_.parsetree(o) if  else_ #and !body
-          result.size==0 and result=[[:nil]]
-          result=result.last #if @op_rescue
-          result=[:begin,result] unless o[:ruby187]||op?||result==[:nil]#||result.first==:begin
-          result
-        end
-      end
-
-      def rescue_parsetree o
-        result=parsetree o
-        result.first==:begin and result=result.last unless o[:ruby187]
-        result
-      end
-
-      def begin_parsetree(o)
-        body,rescues,else_,ensure_=*self
-        needbegin=(rescues&&!rescues.empty?) || ensure_ || @empty_ensure
-        result=parsetree(o)
-        needbegin and result=[:begin, result] unless result.first==:begin
-        result
-      end
-
-      def lvalue
-        return nil unless size==1 
-#        case first
-#        when CommaOpNode,UnaryStarNode: #do nothing
-#        when ParenedNode: return first.lvalue
-#        else return nil
-#        end
-
-        return @lvalue if defined? @lvalue
-        @lvalue=true
-      end
-      attr_writer :lvalue
-
-      def unparse(o=default_unparse_options)
-        if size==1
-          "("+(body&&body.unparse(o))+")"
-        else
-          result="begin "
-          body&&result+= body.unparse(o)
-          result+=unparse_nl(rescues.first,o)
-          rescues.each{|resc| result+=resc.unparse(o) }
-          result+=unparse_nl(ensure_,o)+"ensure "+ensure_.unparse(o) if ensure_
-          result+=unparse_nl(else_,o)+"else "+else_.unparse(o) if else_
-          result+=";end"
-        end
-      end
-    end
-=end
-
     class ParenedNode<ValueNode
-      param_names :body #, :rescues, :else!, :ensure!
+      param_names :body 
+      alias val body
+      alias val= body=
       def initialize(lparen,body,rparen)
         @offset=lparen.offset
         self[0]=body
@@ -1831,7 +1960,11 @@ end
           end
           target.push else_.parsetree(o) if  else_ #and !body
           result.size==0 and result=[[:nil]]
-          result=result.last #if @op_rescue
+          if o[:ruby187] and !rescues.empty?
+            result.unshift :begin
+          else
+            result=result.last
+          end
           result
       end
 
@@ -1845,7 +1978,7 @@ end
           result+=unparse_nl(ensure_,o)+"ensure "+ensure_.unparse(o) if ensure_
           result+=";ensure" if @empty_ensure 
           return result
-       end
+      end
 
     end
 
@@ -1893,7 +2026,11 @@ end
  
       def parsetree(o)
         result=parsetree_and_rescues(o)
-        result=[:begin,result] unless o[:ruby187]||result==[:nil]#||result.first==:begin
+        if o[:ruby187] and result.first==:begin
+          result=result[1]
+        else
+          result=[:begin,result] unless result==[:nil]#||result.first==:begin
+        end
         return result
       end
 
@@ -1923,8 +2060,14 @@ end
       end
     end
 
-    class RescueOpNode<ValueNode
-    #  include OpNode
+    module KeywordOpNode
+      def unparse o=default_unparse_options
+        [left.unparse(o),' ',op,' ',right.unparse(o)].join
+      end
+    end
+
+    class RescueOpNode<RawOpNode
+      include KeywordOpNode
       param_names :body, :rescues #, :else!, :ensure!
       def initialize(expr,rescueword,backup)
             replace [expr,[RescueNode[[],nil,backup]].extend(ListInNode)]
@@ -1934,7 +2077,7 @@ end
       def ensure; nil end
 
       def left; body end
-      def right; rescues.action end
+      def right; rescues[0].action end
 
       alias ensure_ ensure
       alias else_ else
@@ -2021,12 +2164,34 @@ end
       param_names :left,:op,:right
       alias lhs left
       alias rhs right
-      def initialize(*args)
-
+      def self.create(*args)
         if args.size==5
           if args[3].ident=="rescue3"
             lhs,op,rescuee,op2,rescuer=*args
-            rhs=RescueOpNode.new(rescuee.val,op2,rescuer)
+            if MULTIASSIGN===lhs or !rescuee.is_list
+              return RescueOpNode.new(AssignNode.new(lhs,op,rescuee),nil,rescuer)
+            else
+              rhs=RescueOpNode.new(rescuee.val,op2,rescuer)
+            end
+          else
+            lhs,op,bogus1,rhs,bogus2=*args
+          end
+          super(lhs,op,rhs)
+        else super
+        end
+      end
+
+      def initialize(*args)
+
+        if args.size==5
+          #this branch should be dead now
+          if args[3].ident=="rescue3"
+            lhs,op,rescuee,op2,rescuer=*args
+            if MULTIASSIGN===lhs or rescuee.is_list?
+              huh
+            else
+              rhs=RescueOpNode.new(rescuee.val,op2,rescuer)
+            end
           else
             lhs,op,bogus1,rhs,bogus2=*args
           end
@@ -2039,14 +2204,20 @@ end
           lhs=MultiAssign.new([lhs]) unless lhs.after_comma
         when ParenedNode
           if !lhs.after_comma      #look for () around lhs
-          if CommaOpNode===lhs.first
-            lhs=MultiAssign.new(Array.new(lhs.first))
-          else
-            lhs=MultiAssign.new([lhs.first])
+            if CommaOpNode===lhs.first
+              lhs=MultiAssign.new(Array.new(lhs.first))
+              @lhs_parens=true
+            elsif UnaryStarNode===lhs.first
+              lhs=MultiAssign.new([lhs.first])
+              @lhs_parens=true
+            elsif ParenedNode===lhs.first
+              @lhs_parens=true
+              lhs=lhs.first
+            else
+              lhs=lhs.first
+            end
           end
-          @lhs_parens=true
-          end
-        when CommaOpNode: 
+        when CommaOpNode
           lhs=MultiAssign.new lhs
           #rhs=Array.new(rhs) if CommaOpNode===rhs
         end 
@@ -2408,8 +2579,7 @@ end
 #        [:masgn, *super]
 #      end
       def unparse o=default_unparse_options
-        "("+super+")"
-      
+        "("+super+")"      
       end
     end
 
@@ -2471,15 +2641,20 @@ end
       end
     end
  
-    module KeywordOpNode
-      def unparse o=default_unparse_options
-        [left.unparse(o),' ',op,' ',right.unparse(o)].to_s
-      end
-    end
-
-    module LogicalNode
+    class LogicalNode
       include KeywordOpNode
+
+      def self.[](*list)
+        options=list.pop if Hash===list.last
+        result=allocate.replace list
+        opmap=options[:@opmap] if options and options[:@opmap]
+        opmap||=result.op[0,1]*(list.size-1)
+        result.instance_variable_set(:@opmap, opmap)
+        return result
+      end
+
       def initialize(left,op,right)
+        op=op.ident if op.respond_to? :ident
         @opmap=op[0,1]
         case op
         when "&&"; op="and"
@@ -2487,11 +2662,10 @@ end
         end
         #@reverse= op=="or"
         #@op=op
-        @module=LogicalNode
         replace [left,right]
         (size-1).downto(0){|i|
           expr=self[i]
-          if LogicalNode===expr and expr.op==op 
+          if self.class==expr.class
             self[i,1]=Array.new expr
             opmap[i,0]=expr.opmap
           end
@@ -2502,15 +2676,6 @@ end
       OP_EXPAND={?o=>"or", ?a=>"and", ?&=>"&&", ?|=>"||", nil=>""}
       OP_EQUIV={?o=>"or", ?a=>"and", ?&=>"and", ?|=>"or"}
 
-      def reverse
-        /\A[o|]/===@opmap      
-      end
-      def op
-        OP_EQUIV[@opmap[0]]
-      end
-
-      #these 3 methods are defined in RawOpNode too, hence these
-      #definitions are ignored. grrrrrrr.
       def unparse o=default_unparse_options
         result=''
       
@@ -2522,11 +2687,18 @@ end
         }
         return result
       end
-      def left(*args,&block)
-        method_missing(:left,*args,&block)  
+
+      def left
+        self[0]
       end
-      def right(*args,&block)
-        method_missing(:right,*args,&block)
+      def left= val
+        self[0]=val
+      end
+      def right
+        self[1]
+      end
+      def right= val
+        self[1]=val
       end
 
       def parsetree(o)
@@ -2548,21 +2720,44 @@ end
       end
     end
 
-    module WhileOpNode
+    class AndNode<LogicalNode
+      def reverse
+        false
+      end
+
+      def op
+        "and"
+      end
+    end
+
+    class OrNode<LogicalNode
+      def reverse
+        true
+      end
+
+      def op
+        "or"
+      end
+    end
+
+    class WhileOpNode
       include KeywordOpNode
+      param_names :left, :op_, :right
       def condition; right end
       def consequent; left end
-      def initialize(val1,op,val2)
-        self[1]=op
+      def initialize(val1,op,val2=nil)
+        op,val2=nil,op unless val2
+        op=op.ident if op.respond_to? :ident
         @reverse=false
-        @module=WhileOpNode
         @loop=true
         @test_first= !( BeginNode===val1 )
+        replace [val1,val2]
         condition.special_conditions! if condition.respond_to? :special_conditions!
       end
 
       def while; condition end
       def do; consequent end
+      def op; "while" end
 
       def parsetree(o)
         cond=condition.rescue_parsetree(o)
@@ -2583,21 +2778,24 @@ end
       
     end
 
-    module UntilOpNode
+    class UntilOpNode
       include KeywordOpNode
+      param_names :left,:op_,:right
       def condition; right end
       def consequent; left end
-      def initialize(val1,op,val2)
-        self[1]=op
+      def initialize(val1,op,val2=nil)
+        op,val2=nil,op unless val2
+        op=op.ident if op.respond_to? :ident
         @reverse=true
         @loop=true
         @test_first= !( BeginNode===val1 ) 
-        @module=UntilOpNode
+        replace [val1,val2]
         condition.special_conditions! if condition.respond_to? :special_conditions!
       end
 
       def while; negate condition end
       def do; consequent end
+      def op; "until" end
 
       def parsetree(o)
         cond=condition.rescue_parsetree(o)
@@ -2620,15 +2818,17 @@ end
       end
     end
 
-    module UnlessOpNode
+    class UnlessOpNode
       include KeywordOpNode
+      param_names :left, :op_, :right
       def condition; right end
       def consequent; left end
-      def initialize(val1,op,val2)
-        self[1]=op
+      def initialize(val1,op,val2=nil)
+        op,val2=nil,op unless val2
+        op=op.ident if op.respond_to? :ident
         @reverse=true
         @loop=false
-        @module=UnlessOpNode
+        replace [val1,val2]
         condition.special_conditions! if condition.respond_to? :special_conditions!
       end
 
@@ -2636,6 +2836,7 @@ end
       def then; nil end
       def else; consequent end
       def elsifs; [] end
+      def op; "unless" end
 
       def parsetree(o)
         cond=condition.rescue_parsetree(o)
@@ -2648,15 +2849,17 @@ end
       end
     end
 
-    module IfOpNode
+    class IfOpNode
+      param_names :left,:op_,:right
       include KeywordOpNode
       def condition; right end
       def consequent; left end
-      def initialize(left,op,right)
-        self[1]=op
+      def initialize(left,op,right=nil)
+        op,right=nil,op unless right
+        op=op.ident if op.respond_to? :ident
         @reverse=false
         @loop=false
-        @module=IfOpNode
+        replace [left,right]
         condition.special_conditions! if condition.respond_to? :special_conditions!
       end
 
@@ -2664,6 +2867,7 @@ end
       def then; consequent end
       def else; nil end
       def elsifs; [] end
+      def op; "if" end
 
       def parsetree(o)
         cond=condition.rescue_parsetree(o)
@@ -2690,23 +2894,9 @@ end
           #handle inlined hash pairs in param list (if any)
 #          compr=Object.new
 #          def compr.==(other) ArrowOpNode===other end
+          h,arrowrange=param_list.extract_unbraced_hash
           param_list=Array.new(param_list)
-          first=last=nil
-          param_list.each_with_index{|param,i| 
-            break first=i if ArrowOpNode===param
-          }
-          (1..param_list.size).each{|i| param=param_list[-i]
-            break last=-i if ArrowOpNode===param
-          }
-          if first
-            arrowrange=first..last
-            arrows=param_list[arrowrange]
-            h=HashLiteralNode.new(nil,arrows,nil)
-            h.offset=arrows.first.offset
-            h.startline=arrows.first.startline
-            h.endline=arrows.last.endline
-            param_list[arrowrange]=[h]
-          end
+          param_list[arrowrange]=[h] if arrowrange
         
         when ArrowOpNode
           h=HashLiteralNode.new(nil,param_list,nil)
@@ -2732,11 +2922,13 @@ end
           method=method.ident
           fail unless String===method
         end
+
         super(nil,method,param_list,blockparams,block)
         #receiver, if any, is tacked on later
       end
 
       def real_parens; !@not_real_parens end
+      def real_parens= x; @not_real_parens=!x end
 
       def unparse o=default_unparse_options
         fail if block==false
@@ -2749,12 +2941,13 @@ end
          block&&[
            @do_end ? " do " : "{", 
              block_params&&block_params.unparse(o),
-             " ",
+             unparse_nl(block,o," "),
              block.unparse(o),
+             unparse_nl(endline,o),
            @do_end ? " end" : "}"
          ]
         ]
-        return result.to_s
+        return result.join
       end
 
       def image
@@ -2803,6 +2996,7 @@ end
           lasti=args.size-1
         end
         methodname= name
+        methodname= methodname.chop if /^[~!]@$/===methodname
         methodsym=methodname.to_sym
         is_kw= RubyLexer::FUNCLIKE_KEYWORDS&~/^(BEGIN|END|raise)$/===methodname
 
@@ -2997,6 +3191,7 @@ end
       param_names :params,:body
       def initialize(open_brace,formals,stmts,close_brace)
         stmts||=SequenceNode[{:@offset => open_brace.offset, :@startline=>open_brace.startline}]
+        stmts=SequenceNode[stmts,{:@offset => open_brace.offset, :@startline=>open_brace.startline}] unless SequenceNode===stmts
         
         formals&&=BlockParams.new(Array.new(formals))
         @do_end=true unless open_brace.not_real?
@@ -3154,9 +3349,9 @@ end
         newdata=with_string_data(*tokens)
 
         case token
-        when HereDocNode: 
+        when HereDocNode
           token.list_to_append=newdata
-        when StringNode: #do nothing
+        when StringNode #do nothing
         else fail "non-string token class used to construct string node"
         end
         replace token.data
@@ -3174,7 +3369,7 @@ end
       EVEN_NUM_BSLASHES=/(^|[^\\])((?:\\\\)*)/
       def unparse o=default_unparse_options
         o[:linenum]+=@open.count("\n")
-        result=[@open,unparse_interior(o),@close,@modifiers].to_s  
+        result=[@open,unparse_interior(o),@close,@modifiers].join
         o[:linenum]+=@close.count("\n")
         return result
       end
@@ -3262,7 +3457,7 @@ end
             #parse the token list in the string inclusion
             parser=Thread.current[:$RedParse_parser]
             klass=parser.class
-            data[i]=klass.new(tokens, "(string inclusion)",1,[],{:rubyversion=>parser.rubyversion}).parse
+            data[i]=klass.new(tokens, "(string inclusion)",1,[],:rubyversion=>parser.rubyversion,:cache_mode=>:none).parse
           end
         } #if data
 #        was_nul_header= (String===data.first and data.first.empty?) #and o[:quirks]
@@ -3410,7 +3605,7 @@ end
                when '/'
                  numopts=0
                  charset=0
-                 @modifiers.each_byte{|ch| 
+                 RubyLexer::CharHandler.each_char(@modifiers){|ch| 
                    if ch==?o
                      type=:dregx_once
                    elsif numopt=CHAROPT2NUM[ch].nonzero?
@@ -3481,7 +3676,7 @@ end
                when '/'
                  type=:dregx
                  numopts=charset=0
-                 @modifiers.each_byte{|ch| 
+                 RubyLexer::CharHandler.each_char(@modifiers){|ch| 
                    if ch==?o
                      type=:dregx_once
                    elsif numopt=CHAROPT2NUM[ch].nonzero?
@@ -3534,7 +3729,13 @@ end
                end
 
           if vals.size==1
-            vals=[/#{vals[0]}/] if :dregx==type or :dregx_once==type
+            if :dregx==type or :dregx_once==type
+              lang=@modifiers.tr_s("^nesuNESU","")
+              lang=lang[-1,1] unless lang.empty?
+              lang.downcase!
+              regex_options=nil
+              vals=[Regexp_new( vals.first,numopts,lang )]
+            end
             type=DOWNSHIFT_STRING_TYPE[type]
           end
           result= vals.unshift(type)
@@ -3543,6 +3744,25 @@ end
         result=[:match, result] if defined? @implicit_match and @implicit_match
         return result
       end
+
+      if //.respond_to? :encoding
+        LETTER2ENCODING={
+          ?n => Encoding::ASCII,
+          ?u => Encoding::UTF_8,
+          ?e => Encoding::EUC_JP,
+          ?s => Encoding::SJIS,
+          "" => Encoding::ASCII
+        }
+        def Regexp_new(src,opts,lang)
+          src.encode!(LETTER2ENCODING[lang])
+          Regexp.new(src,opts)
+        end
+      else
+        def Regexp_new(src,opts,lang)
+          Regexp.new(src,opts,lang)
+        end
+      end
+
     end
 
     class HereDocNode<StringNode
@@ -3571,7 +3791,8 @@ end
       end
 
 
-      def flattened_ivars_equal?(other)
+      #ignore instance vars in here documents when testing equality
+      def flattened_ivars_equal?(other) 
         StringNode===other
       end
 
@@ -3588,7 +3809,7 @@ end
                 else fail
                 end 
         
-        [lead,@char, inner, @char].to_s
+        [lead,@char, inner, @char].join
       end
     end
 
@@ -3605,17 +3826,19 @@ end
             assert !old_val.raw.has_str_inc?
             val=old_val.raw.translate_escapes(old_val.raw.elems.first).to_sym
           when ?" #"
-            if old_val.raw.has_str_inc?
+            if old_val.raw.has_str_inc? or old_val.raw.elems==[""]
               val=StringNode.new(old_val.raw) #ugly hack: this isn't literal
             else
               val=old_val.raw.translate_escapes(old_val.raw.elems.first).to_sym
             end
           else #val=val[1..-1].to_sym
-            if StringToken===old_val.raw
-              val=old_val.raw.translate_escapes(old_val.raw.elems.first).to_sym
-            else
-              val=old_val.raw.to_sym
+            val=old_val.raw
+            if StringToken===val
+              val=val.translate_escapes(val.elems.first)
+            elsif /^[!~]@$/===val
+              val=val.chop
             end
+            val=val.to_sym
           end
         when NumberToken 
           case val
@@ -3658,7 +3881,8 @@ end
           ":"+
             val.unparse(o)
         when Float
-          s= "%#{Float::DIG+1}.#{Float::DIG+1}f"%val
+          s= val.accurate_to_s
+          #why must it be *2? I wouldn't think any fudge factor would be necessary
           case s
           when /-inf/i; s="-"+Inf
           when /inf/i;  s=    Inf
@@ -3707,7 +3931,7 @@ end
         if name.ident=='(' 
           #simulate nil
           replace ['nil']
-          @value=false
+          @value=nil
         else
           replace [name.ident]
           @value=name.respond_to?(:value) && name.value
@@ -3746,7 +3970,14 @@ end
         @offset=lbrack.offset
         contents or return super()
         if CommaOpNode===contents
+          h,arrowrange=contents.extract_unbraced_hash
+          contents[arrowrange]=[h] if arrowrange
           super( *contents )
+        elsif ArrowOpNode===contents
+          h=HashLiteralNode.new(nil,contents,nil)
+          h.startline=contents.startline
+          h.endline=contents.endline
+          super HashLiteralNode.new(nil,contents,nil)
         else
           super contents
         end
@@ -3827,7 +4058,7 @@ end
         result=@reverse ? "unless " : "if "
         result+="#{condition.unparse o}"
         result+=unparse_nl(consequent,o)+"#{consequent.unparse(o)}" if consequent
-        result+=unparse_nl(elsifs.first,o)+elsifs.map{|n| n.unparse(o)}.to_s if elsifs
+        result+=unparse_nl(elsifs.first,o)+elsifs.map{|n| n.unparse(o)}.join if elsifs
         result+=unparse_nl(else_,o)+"else "+else_.unparse(o) if else_
         result+=";else " if defined? @empty_else
         result+=";end"
@@ -3921,7 +4152,7 @@ end
       def image; "(elsif)" end
 
       def unparse o=default_unparse_options
-        "elsif #{condition.unparse o}#{unparse_nl(consequent,o)}#{consequent.unparse o};"
+        "elsif #{condition.unparse o}#{unparse_nl(consequent,o)}#{consequent.unparse o if consequent};"
       end
 
       def to_lisp
@@ -3953,7 +4184,7 @@ end
          condition.unparse(o), unparse_nl(body||self,o),
          body&&body.unparse(o),
          ";end"
-        ].to_s
+        ].join
       end
 
       def while
@@ -3989,7 +4220,10 @@ end
       def initialize(caseword, condition, semi, whens, otherwise, endword)
         @offset=caseword.offset
         if otherwise
-          otherwise=otherwise.val or @empty_else=true
+          otherwise=otherwise.val
+          @empty_else=!otherwise
+        else
+          @empty_else=false
         end
         whens.extend ListInNode
         super(condition,whens,otherwise)
@@ -3999,9 +4233,10 @@ end
 
       def unparse o=default_unparse_options
         result="case #{condition&&condition.unparse(o)}"+
-               whens.map{|wh| wh.unparse o}.to_s
+               whens.map{|wh| wh.unparse o}.join
 
         result += unparse_nl(otherwise,o)+"else "+otherwise.unparse(o) if otherwise
+        result += ";else;" if @empty_else
         result += ";end"
 
         return result
@@ -4162,11 +4397,13 @@ end
             data=Array[*contents]
           end
           super(*data)
+        else fail
         end
         @no_braces=!open
       end
 
       attr :no_arrows
+      attr_accessor :no_braces
       attr_writer :offset
 
       def image; "({})" end
@@ -4285,6 +4522,9 @@ end
 
       attr_reader :empty_ensure, :empty_else
 
+      def self.namelist
+        %w[receiver name args body rescues elses ensures]
+      end
 
 #      def receiver= x
 #        self[0]=x      
@@ -4309,7 +4549,7 @@ end
       def unparse o=default_unparse_options
         result=[
          "def ",receiver&&receiver.unparse(o)+'.',name,
-           args ? '('+args.map{|arg| arg.unparse o}.join(',')+')' : unparse_nl(body||self,o)
+           args && '('+args.map{|arg| arg.unparse o}.join(',')+')', unparse_nl(body||self,o)
         ]
         result<<unparse_and_rescues(o)
 =begin
@@ -4322,7 +4562,7 @@ end
         result+="ensure\n" if @empty_ensure
 =end
         result<<unparse_nl(endline,o)+"end"
-        result.to_s
+        result.join
       end
 
       def to_lisp
@@ -4331,7 +4571,9 @@ end
       end
 
       def parsetree(o)
-        name=name().to_sym
+        name=name()
+        name=name.chop if /^[!~]@$/===name
+        name=name.to_sym
 
         result=[name, target=[:scope, [:block, ]] ]
         if receiver
@@ -4457,7 +4699,9 @@ end
       end
 
       def str2parsetree(str,o)
-       if String===str then [:lit, str.to_sym] 
+       if String===str 
+         str=str.chop if /^[!~]@$/===str
+         [:lit, str.to_sym] 
        else 
          result=str.parsetree(o)
          result[0]=:dsym
@@ -4543,7 +4787,7 @@ end
       def image; "(module #{name})" end
 
       def unparse o=default_unparse_options
-        "module #{name.unparse o}#{unparse_nl(body||self,o)}#{unparse_and_rescues(o)};end"
+        "module #{name.unparse o}#{unparse_nl(body||self,o)}#{unparse_and_rescues(o)}#{unparse_nl(endline,o)}end"
       end
 
       def parent; nil end
@@ -4594,7 +4838,10 @@ end
       def unparse o=default_unparse_options
         result="class #{name.unparse o}"
         result+=" < #{parent.unparse o}" if parent
-        result+=unparse_nl(body||self,o)+"#{unparse_and_rescues(o)};end"
+        result+=unparse_nl(body||self,o)+
+                  unparse_and_rescues(o)+
+                unparse_nl(endline,o)+
+                "end"
         return result
       end
 
@@ -4636,6 +4883,7 @@ end
       alias object val
       alias obj val
       alias receiver val
+      alias receiver= val=
       alias name val
 
       alias ensure_ ensure
@@ -4738,17 +4986,30 @@ end
 
     class BracketsGetNode<ValueNode
       param_names(:receiver,:lbrack_,:params,:rbrack_)
+      alias args params
       def initialize(receiver,lbrack,params,rbrack)
-        params=case params
-        when CommaOpNode; Array.new params
+        case params
+        when CommaOpNode
+          h,arrowrange=params.extract_unbraced_hash
+          params=Array.new params
+          params[arrowrange]=[h] if arrowrange          
+        when ArrowOpNode 
+          h=HashLiteralNode.new(nil,params,nil)
+          h.startline=params.startline
+          h.endline=params.endline
+          params=[h]
         when nil
-        else [params]
+          params=nil
+        else 
+          params=[params]
         end
         params.extend ListInNode if params
         @offset=receiver.offset
         super(receiver,params)
       end
 
+      def name; "[]" end
+ 
       def image; "(#{receiver.image}.[])" end
 
       def unparse o=default_unparse_options
@@ -4756,7 +5017,7 @@ end
           '[',
           params&&params.map{|param| param.unparse o}.join(','),
           ']'
-        ].to_s
+        ].join
       end
 
       def parsetree(o)
@@ -4861,7 +5122,13 @@ end
       alias msg error?
     end
 
-#  end
+
+    module Nodes
+      ::RedParse::constants.each{|k| 
+        const=::RedParse::const_get(k)
+        const_set( k,const ) if Module===const and ::RedParse::Node>=const
+      }
+    end
 
 end
 =begin a (formal?) description
